@@ -1531,7 +1531,8 @@ def test_audit_existing_endpoints_unchanged():
 # ---------- /firewall/simulate ----------
 
 
-def post_firewall(rules, events, default_action="deny", session_timeout=30):
+def post_firewall(rules, events, default_action="deny", session_timeout=30,
+                  max_sessions=10000):
     return client.post(
         "/firewall/simulate",
         json={
@@ -1539,6 +1540,7 @@ def post_firewall(rules, events, default_action="deny", session_timeout=30):
             "events": events,
             "default_action": default_action,
             "session_timeout": session_timeout,
+            "max_sessions": max_sessions,
         },
     )
 
@@ -1589,6 +1591,7 @@ def test_firewall_stateful_lifecycle_and_summary():
     assert body["event_count"] == 5
     assert body["default_action"] == "deny"
     assert body["session_timeout"] == 30
+    assert body["max_sessions"] == 10000
 
     results = body["results"]
     assert [r["index"] for r in results] == [0, 1, 2, 3, 4]
@@ -1609,6 +1612,9 @@ def test_firewall_stateful_lifecycle_and_summary():
     assert results[1]["match"]["rule_index"] is None
     assert results[3]["match"]["rule_index"] == 1  # deny 兜底规则
 
+    # 未发生淘汰时逐事件 evicted_session 为 null
+    assert all(r["evicted_session"] is None for r in results)
+
     # stateful 放行携带正向会话键（src/dst 与反向包相反）
     session = results[1]["session"]
     assert session["key"] == {
@@ -1623,6 +1629,13 @@ def test_firewall_stateful_lifecycle_and_summary():
     assert session["rule_index"] == 0
     assert session["established_by_event"] == 0
 
+    # last_seen：建立时等于时间戳，stateful 命中刷新（expires_at 不刷新）
+    assert results[0]["session"]["last_seen"] == 0
+    assert results[1]["session"]["last_seen"] == 5
+    assert results[2]["session"]["last_seen"] == 30
+    assert results[3]["session"]["last_seen"] == 30  # expired 带原会话末值
+    assert results[4]["session"]["last_seen"] == 50
+
     assert results[3]["session"]["expires_at"] == 30  # expired 带原会话
     assert results[4]["session"]["created_at"] == 50
     assert results[4]["session"]["expires_at"] == 80
@@ -1632,6 +1645,7 @@ def test_firewall_stateful_lifecycle_and_summary():
         "denied": 1,
         "new_sessions": 2,
         "expired_sessions": 1,
+        "evicted_sessions": 0,
         "active_sessions": 1,
     }
 
@@ -1648,11 +1662,13 @@ def test_firewall_denied_forward_no_session_and_reverse_denied():
     assert [r["match"]["type"] for r in results] == ["rule", "rule"]
     assert [r["session_state"] for r in results] == ["none", "none"]
     assert all(r["session"] is None for r in results)
+    assert all(r["evicted_session"] is None for r in results)
     assert resp.json()["summary"] == {
         "allowed": 0,
         "denied": 2,
         "new_sessions": 0,
         "expired_sessions": 0,
+        "evicted_sessions": 0,
         "active_sessions": 0,
     }
 
@@ -1759,6 +1775,121 @@ def test_firewall_reverse_after_expiry_may_start_new_forward_session():
     assert [r["session_state"] for r in resp.json()["results"]] == ["new", "new"]
 
 
+def test_firewall_capacity_eviction_and_rejudgement():
+    # max_sessions=1：事件 2 建会话淘汰流 1（last_seen=5 更晚则不淘汰它）；
+    # 事件 3 是被淘汰流的反向包，必须重新走规则，命中 deny 兜底
+    rules = [FW_ALLOW_WEB, FW_DENY_OTHERS]
+    events = [
+        fw_event(0, "10.0.0.10", 40000, "10.0.1.20", 80),
+        fw_event(5, "10.0.1.20", 80, "10.0.0.10", 40000, direction="reverse"),
+        fw_event(10, "10.0.0.11", 40001, "10.0.1.20", 80),
+        fw_event(11, "10.0.1.20", 80, "10.0.0.10", 40000, direction="reverse"),
+    ]
+    resp = post_firewall(rules, events, max_sessions=1)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    results = body["results"]
+
+    assert [r["session_state"] for r in results] == [
+        "new", "active", "new", "expired"
+    ]
+    assert [r["match"]["type"] for r in results] == [
+        "rule", "stateful", "rule", "rule"
+    ]
+    assert [r["action"] for r in results] == ["allow", "allow", "allow", "deny"]
+
+    # 仅事件 2 发生淘汰；被淘汰的是流 1（last_seen 已刷新到 5 也仍是唯一候选）
+    assert results[0]["evicted_session"] is None
+    assert results[1]["evicted_session"] is None
+    evicted = results[2]["evicted_session"]
+    assert evicted is not None
+    assert evicted["key"] == {
+        "protocol": "tcp",
+        "src_ip": "10.0.0.10",
+        "dst_ip": "10.0.1.20",
+        "src_port": 40000,
+        "dst_port": 80,
+    }
+    assert evicted["created_at"] == 0
+    assert evicted["last_seen"] == 5
+    assert evicted["expires_at"] == 30
+    assert evicted["rule_index"] == 0
+    assert evicted["established_by_event"] == 0
+    assert results[3]["evicted_session"] is None
+
+    # expired 事件携带被淘汰会话
+    assert results[3]["session"]["established_by_event"] == 0
+    assert results[3]["session"]["last_seen"] == 5
+
+    assert body["max_sessions"] == 1
+    assert body["summary"] == {
+        "allowed": 3,
+        "denied": 1,
+        "new_sessions": 2,
+        "expired_sessions": 0,
+        "evicted_sessions": 1,
+        "active_sessions": 1,
+    }
+
+
+def test_firewall_last_seen_decides_eviction_victim():
+    # 容量 2：A 在 t=8 被刷新，B 从未再有流量；建 C 时淘汰 last_seen 更早的 B
+    rules = [
+        {"action": "allow", "src_cidr": "0.0.0.0/0", "dst_cidr": "0.0.0.0/0",
+         "protocol": "tcp", "port_start": 0, "port_end": 65535},
+    ]
+    events = [
+        fw_event(0, "1.1.1.1", 1000, "2.2.2.2", 80),
+        fw_event(1, "1.1.1.2", 2000, "2.2.2.2", 80),
+        fw_event(8, "2.2.2.2", 80, "1.1.1.1", 1000, direction="reverse"),
+        fw_event(9, "1.1.1.3", 3000, "2.2.2.2", 80),
+    ]
+    resp = post_firewall(rules, events, max_sessions=2, session_timeout=1000)
+    assert resp.status_code == 200, resp.text
+    results = resp.json()["results"]
+    evicted = results[3]["evicted_session"]
+    assert evicted["key"]["src_ip"] == "1.1.1.2"
+    assert evicted["last_seen"] == 1
+    # A 因 t=8 的反向包仍是存活会话，事件 3 的反向包不是本测试内容
+    assert resp.json()["summary"]["active_sessions"] == 2
+
+
+def test_firewall_evicted_flow_reallowed_then_reestablished():
+    # 被淘汰流的正向包重新 allow -> expired_reestablished，并再次淘汰占位会话
+    rules = [FW_ALLOW_WEB]
+    events = [
+        fw_event(0, "10.0.0.10", 40000, "10.0.1.20", 80),
+        fw_event(10, "10.0.0.11", 40001, "10.0.1.20", 80),
+        fw_event(20, "10.0.0.10", 40000, "10.0.1.20", 80),
+    ]
+    resp = post_firewall(rules, events, max_sessions=1, session_timeout=1000)
+    assert resp.status_code == 200, resp.text
+    results = resp.json()["results"]
+    assert [r["session_state"] for r in results] == [
+        "new", "new", "expired_reestablished"
+    ]
+    assert results[1]["evicted_session"]["key"]["src_ip"] == "10.0.0.10"
+    assert results[2]["evicted_session"]["key"]["src_ip"] == "10.0.0.11"
+    assert results[2]["session"]["created_at"] == 20
+    assert resp.json()["summary"]["evicted_sessions"] == 2
+
+
+def test_firewall_max_sessions_validation_422():
+    valid_event = fw_event(0, "10.0.0.10", 40000, "10.0.1.20", 80)
+
+    # 缺少 max_sessions
+    assert client.post(
+        "/firewall/simulate",
+        json={"rules": [], "events": [valid_event],
+              "default_action": "deny", "session_timeout": 30},
+    ).status_code == 422
+
+    # 越界 / 类型非法
+    for bad in (0, 10001, True, 1.5, "100", None, -1):
+        resp = post_firewall([FW_ALLOW_WEB], [valid_event], max_sessions=bad)
+        assert resp.status_code == 422, bad
+
+
 def test_firewall_validation_422():
     valid_event = fw_event(0, "1.1.1.1", 1000, "2.2.2.2", 80)
     valid_rule = FW_ALLOW_WEB
@@ -1773,6 +1904,16 @@ def test_firewall_validation_422():
         "/firewall/simulate",
         json={"rules": [], "events": [valid_event], "session_timeout": 30},
     ).status_code == 422  # 缺 default_action
+    assert client.post(
+        "/firewall/simulate",
+        json={"rules": [], "events": [valid_event],
+              "default_action": "deny", "session_timeout": 30},
+    ).status_code == 422  # 缺 max_sessions
+    assert client.post(
+        "/firewall/simulate",
+        json={"rules": [], "events": [valid_event],
+              "default_action": "deny", "max_sessions": 100},
+    ).status_code == 422  # 缺 session_timeout
 
     # 空事件 / 超过 2000 个事件
     assert post_firewall([valid_rule], []).status_code == 422
@@ -1871,6 +2012,19 @@ def test_firewall_openapi_documented():
     # 请求示例
     req_examples = operation["requestBody"]["content"]["application/json"]["examples"]
     assert "simulate" in req_examples
+    assert req_examples["simulate"]["value"]["max_sessions"] == 1
+
+    # 请求 / 响应模型包含新增容量与 last_seen / evicted 字段
+    request_schema = spec["components"]["schemas"]["FirewallSimulateRequest"]
+    assert "max_sessions" in request_schema["required"]
+    session_schema = spec["components"]["schemas"]["FirewallSession"]["properties"]
+    assert "last_seen" in session_schema
+    result_schema = spec["components"]["schemas"]["FirewallEventResult"]["properties"]
+    assert "evicted_session" in result_schema
+    summary_props = spec["components"]["schemas"]["FirewallSummary"]["properties"]
+    assert "evicted_sessions" in summary_props
+    response_props = spec["components"]["schemas"]["FirewallSimulateResponse"]["properties"]
+    assert "max_sessions" in response_props
 
 
 def test_firewall_existing_endpoints_unchanged():
