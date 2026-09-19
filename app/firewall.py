@@ -12,10 +12,16 @@
    ``建立时刻 + session_timeout``（固定时长，不因后续包刷新；边界时刻仍存活，
    严格大于过期时刻才清理）。
 3. **状态放行**：会话存活期间，该五元组的后续正向包与**反向（reverse）**包
-   （地址/端口对调后的五元组命中同一会话）一律 ``stateful`` 放行，不再走规则。
+   （地址/端口对调后的五元组命中同一会话）一律 ``stateful`` 放行，不再走规则；
+   每次命中（正向或反向）都会把会话的 ``last_seen`` 刷新为当前事件时间。
 4. **超时重判**：会话过期后（惰性清理：每个事件处理前按其时间戳清理），
    后续包必须重新走规则匹配；反向包即使重新被规则放行也**不会**新建会话，
    正向包重新被规则放行则**重建**会话。
+5. **固定容量与淘汰**：会话表容量固定为 ``max_sessions``（1～10000）。正向
+   allow 通过重叠检查、确认可以建会话而容量已满时，先淘汰 ``last_seen`` 最早
+   的**存活**会话（``last_seen`` 相同则取 ``established_by_event`` 最小者），
+   再建立新会话。被淘汰会话即从会话表移除，该流的后续包必须重新走规则裁决，
+   如同该流从未建过会话。
 
 会话以正向五元组为键。新会话建立时，其正向键或反向键与任何**存活**会话冲突
 （同键重复建立、或两个方向相反的会话同时存活）即判定为
@@ -42,6 +48,10 @@ FIREWALL_EVENTS_MAX = 2000
 #: 会话存活时间（秒）取值范围
 SESSION_TIMEOUT_MIN = 1
 SESSION_TIMEOUT_MAX = 86400
+
+#: 会话表容量（最大并发存活会话数）取值范围
+MAX_SESSIONS_MIN = 1
+MAX_SESSIONS_MAX = 10000
 
 #: 端口取值范围
 PORT_MIN = 0
@@ -187,6 +197,19 @@ def normalize_session_timeout(value: object) -> int:
         raise ValueError(
             f"session_timeout 必须在 {SESSION_TIMEOUT_MIN}～{SESSION_TIMEOUT_MAX} "
             f"秒之间，实际 {value}"
+        )
+    return value
+
+
+def normalize_max_sessions(value: object) -> int:
+    """校验会话表容量：非 bool 整数且在 1～10000 之间。"""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"max_sessions 必须是 {MAX_SESSIONS_MIN}～"
+                         f"{MAX_SESSIONS_MAX} 的整数: {value!r}")
+    if not MAX_SESSIONS_MIN <= value <= MAX_SESSIONS_MAX:
+        raise ValueError(
+            f"max_sessions 必须在 {MAX_SESSIONS_MIN}～{MAX_SESSIONS_MAX} "
+            f"之间，实际 {value}"
         )
     return value
 
@@ -360,6 +383,7 @@ def _session_json(session: dict) -> dict:
     return {
         "key": _key_to_json(session["key"]),
         "created_at": session["created_at"],
+        "last_seen": session["last_seen"],
         "expires_at": session["expires_at"],
         "rule_index": session["rule_index"],
         "established_by_event": session["event_index"],
@@ -371,6 +395,7 @@ def simulate_firewall(
     events: Sequence[Sequence[object]],
     default_action: object,
     session_timeout: object,
+    max_sessions: object,
 ) -> dict:
     """模拟有状态防火墙，逐事件返回裁决与会话状态。
 
@@ -379,7 +404,9 @@ def simulate_firewall(
     允许为空；``events`` 每项为
     ``(timestamp, src_ip, dst_ip, protocol, src_port, dst_port, direction)``，
     至少 1 个且时间戳严格递增；tcp/udp 事件必须带两个端口，icmp 事件必须
-    不带端口；``session_timeout`` 为 1～86400 秒的固定会话存活时间。
+    不带端口；``session_timeout`` 为 1～86400 秒的固定会话存活时间；
+    ``max_sessions`` 为 1～10000 的固定会话表容量，容量已满且新会话通过
+    重叠检查时，先淘汰 ``last_seen`` 最早（相同则建立事件最早）的存活会话。
 
     返回可直接 JSON 序列化的字典（结构见 README）。时间戳乱序抛出
     :class:`OutOfOrderTimestampsError`，会话键重叠抛出
@@ -387,6 +414,7 @@ def simulate_firewall(
     """
     default_action = normalize_action(default_action)
     session_timeout = normalize_session_timeout(session_timeout)
+    max_sessions = normalize_max_sessions(max_sessions)
 
     if not 0 <= len(rules) <= FIREWALL_RULES_MAX:
         raise ValueError(f"规则数必须在 0～{FIREWALL_RULES_MAX} 之间，实际 {len(rules)}")
@@ -405,7 +433,7 @@ def simulate_firewall(
     expired_flows: dict[tuple, dict] = {}
 
     results: list[dict] = []
-    allowed = denied = new_sessions = expired_sessions = 0
+    allowed = denied = new_sessions = expired_sessions = evicted_sessions = 0
 
     for event in parsed_events:
         timestamp = event["timestamp"]
@@ -420,9 +448,11 @@ def simulate_firewall(
         key = _flow_key(event)
         live_session = sessions.get(key)
         was_expired = key in expired_flows
+        evicted_session = None
 
         if live_session is not None:
-            # 存活会话：正向后续包与反向包一律 stateful 放行
+            # 存活会话：正向后续包与反向包一律 stateful 放行，并刷新 last_seen
+            live_session["last_seen"] = timestamp
             match = {"type": MATCH_STATEFUL, "rule_index": None}
             action = ALLOW
             session_state = SESSION_ACTIVE
@@ -460,9 +490,24 @@ def simulate_firewall(
                         _key_to_json(key),
                     )
 
+                # 重叠检查通过、确认可建会话后，容量已满则淘汰一个存活会话：
+                # last_seen 最早者优先；相同则 established_by_event 最小者优先。
+                if len(sessions) >= max_sessions:
+                    victim_key = min(
+                        sessions,
+                        key=lambda k: (
+                            sessions[k]["last_seen"],
+                            sessions[k]["event_index"],
+                        ),
+                    )
+                    victim = sessions.pop(victim_key)
+                    evicted_session = _session_json(victim)
+                    evicted_sessions += 1
+
                 new_session = {
                     "key": key,
                     "created_at": timestamp,
+                    "last_seen": timestamp,
                     "expires_at": timestamp + session_timeout,
                     "rule_index": rule_index,
                     "event_index": event["index"],
@@ -501,6 +546,7 @@ def simulate_firewall(
                 "action": action,
                 "session_state": session_state,
                 "session": session_obj,
+                "evicted_session": evicted_session,
             }
         )
 
@@ -509,12 +555,14 @@ def simulate_firewall(
         "event_count": len(parsed_events),
         "default_action": default_action,
         "session_timeout": session_timeout,
+        "max_sessions": max_sessions,
         "results": results,
         "summary": {
             "allowed": allowed,
             "denied": denied,
             "new_sessions": new_sessions,
             "expired_sessions": expired_sessions,
+            "evicted_sessions": evicted_sessions,
             "active_sessions": len(sessions),
         },
     }

@@ -64,11 +64,16 @@ CIDR 变更（`cidr_changed`）与未变（`unchanged`），并在各自清单�
 严格递增**的数据包事件，按**首条匹配规则生效**逐事件裁决。首个最终放行的
 **正向（forward）**包建立五元组会话 `(protocol, src_ip, src_port, dst_ip,
 dst_port)`，在固定的 `session_timeout` 存活时间内，会话的后续正向包与
-**反向（reverse）**包一律 `stateful` 自动放行、不再查规则；超时（惰性清理：
+**反向（reverse）**包一律 `stateful` 自动放行、不再查规则，且每次命中都把
+会话的 `last_seen` 刷新为当前时间；超时（惰性清理：
 `created_at + session_timeout` 边界时刻仍存活，严格超过才过期）后的包必须
 **重新走规则匹配**——反向包即使重新放行也不建会话，正向包重新放行则重建会话。
-逐事件返回命中规则或 `stateful` / 默认动作、最终动作与会话状态，并汇总放行 /
-拒绝 / 新建 / 过期数量；乱序时间戳、非法端口与重叠会话键均返回 **422**。
+会话表容量固定为 `max_sessions`（1～10000）：正向 allow 通过重叠检查、确认
+可建会话而容量已满时，先淘汰 `last_seen` 最早的存活会话（相同则
+`established_by_event` 最小者优先），被淘汰流的后续包必须重新按规则裁决。
+逐事件返回命中规则或 `stateful` / 默认动作、最终动作、会话状态与本事件淘汰
+的会话，并汇总放行 / 拒绝 / 新建 / 过期 / 淘汰数量；乱序时间戳、非法端口与
+重叠会话键均返回 **422**。
 
 > 遮蔽来源不区分动作：先前的 **allow 与 deny 规则取并集**，共同遮蔽后续规则。
 
@@ -1465,12 +1470,21 @@ curl -s http://localhost:8000/routes/audit \
    五元组会话 `(protocol, src_ip, src_port, dst_ip, dst_port)`。会话**固定**
    存活 `session_timeout` 秒（不因后续流量刷新），过期边界为
    `created_at + session_timeout`——**边界时刻仍存活，严格超过才过期**。
+   新会话的 `last_seen` 等于建立时间。
 3. **状态放行**：存活期内，该会话的后续正向包与 **`reverse`（反向）**包
-   （地址/端口对调后的五元组命中同一会话）一律 `stateful` 放行，**不再查规则**。
+   （地址/端口对调后的五元组命中同一会话）一律 `stateful` 放行，**不再查规则**；
+   无论正向还是反向命中，会话的 `last_seen` 都更新为当前事件时间（**不延长**
+   固定过期时刻）。
 4. **超时重判**：每个事件处理前按其时间戳**惰性清理**全部过期会话；过期后的
    包（含反向包）必须**重新走规则匹配**：反向包即使重新被 `allow` 也**不建立
    会话**；正向包重新被 `allow` 则**重建**会话（状态 `expired_reestablished`）。
-5. **重叠会话键**：新会话的正向键或反向键与任何**存活**会话冲突（同键重复
+5. **固定容量淘汰**：会话表容量固定为 `max_sessions`（1～10000）。正向 allow
+   建会话时**先执行既有重叠检查**，确认可以建立且容量已满时，淘汰
+   **`last_seen` 最早的存活会话**（`last_seen` 相同则 `established_by_event`
+   最小者优先），再建立新会话。被淘汰会话即从会话表移除，该流的后续包必须
+   **重新按规则裁决**（与从未建立过会话一致）；先于淘汰的重叠冲突直接返回
+   422，不淘汰、不产生部分结果。
+6. **重叠会话键**：新会话的正向键或反向键与任何**存活**会话冲突（同键重复
    建立、或两个方向相反的会话同时存活）时返回 **422**
    （`error="overlapping_session"`），不产生部分结果；一方过期后再建立则合法。
 
@@ -1493,6 +1507,9 @@ curl -s http://localhost:8000/routes/audit \
   - `direction`：`forward` / `reverse`（大小写不敏感）。
 - `default_action`：未命中任何规则时的动作，`allow` / `deny`。
 - `session_timeout`：会话固定存活时间，**1～86400 秒**的整数。
+- `max_sessions`：**必填**，固定会话表容量（最大并发存活会话数），
+  **1～10000 的整数**；容量已满且正向 allow 通过重叠检查时淘汰
+  `last_seen` 最早（相同则建立事件最早）的存活会话。
 
 #### 响应字段
 
@@ -1503,11 +1520,18 @@ curl -s http://localhost:8000/routes/audit \
 | `results[].match.rule_index` | 命中规则序号（从 0 开始）；`stateful` / `default` 为 `null`；stateful 放行的原始规则见 `session.rule_index` |
 | `results[].action` | 最终动作 `allow` / `deny`（stateful 命中恒为 `allow`） |
 | `results[].session_state` | 会话状态，见下表 |
-| `results[].session` | 关联的正向会话（五元组键 / `created_at` / `expires_at` / 建立规则与事件序号）；`none` 为 `null` |
+| `results[].session` | 关联的正向会话（五元组键 / `created_at` / `last_seen` / `expires_at` / 建立规则与事件序号）；`none` 为 `null` |
+| `results[].evicted_session` | 本事件为建会话而淘汰的存活会话（结构同 `session`，携带淘汰前的最终 `last_seen`）；未发生淘汰为 `null` |
 | `summary.allowed` / `.denied` | 最终动作为放行 / 拒绝的**事件数**（stateful 放行计入 allowed） |
 | `summary.new_sessions` | 新建会话数（含过期重建） |
 | `summary.expired_sessions` | 惰性清理掉的过期会话总数（**按会话计**，由触发清理的事件统一记账） |
+| `summary.evicted_sessions` | 容量满时淘汰的存活会话总数（**按会话计**） |
 | `summary.active_sessions` | 全部事件处理完后仍存活的会话数 |
+
+顶层还回显 `max_sessions`（请求的会话表容量）。会话对象的 `last_seen`
+为最近一次命中该会话的事件时间：新会话等于 `created_at`，之后每次正向 /
+反向 stateful 命中都刷新为当前事件时间；`expires_at` 始终为
+`created_at + session_timeout`，**不因 `last_seen` 刷新而延长**。
 
 会话状态 `session_state`：
 
@@ -1537,6 +1561,7 @@ curl -s http://localhost:8000/routes/audit \
   ],
   "default_action": "deny",
   "session_timeout": 30,
+  "max_sessions": 10000,
   "events": [
     {"timestamp": 0,  "src_ip": "10.0.0.10", "dst_ip": "10.0.1.20",
      "protocol": "tcp", "src_port": 40000, "dst_port": 80, "direction": "forward"},
@@ -1552,7 +1577,8 @@ curl -s http://localhost:8000/routes/audit \
 }
 ```
 
-响应：
+响应（会话对象新增 `last_seen`，逐事件新增 `evicted_session`，`summary`
+新增 `evicted_sessions`；本例容量充足，无淘汰）：
 
 ```json
 {
@@ -1560,6 +1586,7 @@ curl -s http://localhost:8000/routes/audit \
   "event_count": 5,
   "default_action": "deny",
   "session_timeout": 30,
+  "max_sessions": 10000,
   "results": [
     {
       "index": 0, "timestamp": 0,
@@ -1570,9 +1597,10 @@ curl -s http://localhost:8000/routes/audit \
       "session": {
         "key": {"protocol": "tcp", "src_ip": "10.0.0.10", "dst_ip": "10.0.1.20",
                 "src_port": 40000, "dst_port": 80},
-        "created_at": 0, "expires_at": 30,
+        "created_at": 0, "last_seen": 0, "expires_at": 30,
         "rule_index": 0, "established_by_event": 0
-      }
+      },
+      "evicted_session": null
     },
     {
       "index": 1, "timestamp": 5,
@@ -1583,9 +1611,10 @@ curl -s http://localhost:8000/routes/audit \
       "session": {
         "key": {"protocol": "tcp", "src_ip": "10.0.0.10", "dst_ip": "10.0.1.20",
                 "src_port": 40000, "dst_port": 80},
-        "created_at": 0, "expires_at": 30,
+        "created_at": 0, "last_seen": 5, "expires_at": 30,
         "rule_index": 0, "established_by_event": 0
-      }
+      },
+      "evicted_session": null
     },
     {
       "index": 2, "timestamp": 30,
@@ -1596,9 +1625,10 @@ curl -s http://localhost:8000/routes/audit \
       "session": {
         "key": {"protocol": "tcp", "src_ip": "10.0.0.10", "dst_ip": "10.0.1.20",
                 "src_port": 40000, "dst_port": 80},
-        "created_at": 0, "expires_at": 30,
+        "created_at": 0, "last_seen": 30, "expires_at": 30,
         "rule_index": 0, "established_by_event": 0
-      }
+      },
+      "evicted_session": null
     },
     {
       "index": 3, "timestamp": 31,
@@ -1609,9 +1639,10 @@ curl -s http://localhost:8000/routes/audit \
       "session": {
         "key": {"protocol": "tcp", "src_ip": "10.0.0.10", "dst_ip": "10.0.1.20",
                 "src_port": 40000, "dst_port": 80},
-        "created_at": 0, "expires_at": 30,
+        "created_at": 0, "last_seen": 30, "expires_at": 30,
         "rule_index": 0, "established_by_event": 0
-      }
+      },
+      "evicted_session": null
     },
     {
       "index": 4, "timestamp": 50,
@@ -1622,9 +1653,10 @@ curl -s http://localhost:8000/routes/audit \
       "session": {
         "key": {"protocol": "tcp", "src_ip": "10.0.0.10", "dst_ip": "10.0.1.20",
                 "src_port": 40000, "dst_port": 80},
-        "created_at": 50, "expires_at": 80,
+        "created_at": 50, "last_seen": 50, "expires_at": 80,
         "rule_index": 0, "established_by_event": 4
-      }
+      },
+      "evicted_session": null
     }
   ],
   "summary": {
@@ -1632,7 +1664,99 @@ curl -s http://localhost:8000/routes/audit \
     "denied": 1,
     "new_sessions": 2,
     "expired_sessions": 1,
+    "evicted_sessions": 0,
     "active_sessions": 1
+  }
+}
+```
+
+#### 容量淘汰示例（200）
+
+`max_sessions=2`、`session_timeout=100`（全部会话均未超时）：流 A 在 `t=0`
+建立、`t=2` 的反向包把其 `last_seen` 刷新为 2；流 B 在 `t=1` 建立后无流量，
+`last_seen` 仍为 1。`t=3` 流 C 的正向 allow 通过重叠检查后容量已满，淘汰
+**`last_seen` 更早的 B（=1）而非 A（=2）**；`t=4` B 的反向包已无存活会话，
+重新走规则被 allow，但反向包不建会话（`none`）：
+
+请求：
+
+```json
+{
+  "rules": [
+    {"action": "allow", "src_cidr": "0.0.0.0/0", "dst_cidr": "0.0.0.0/0",
+     "protocol": "tcp", "port_start": 0, "port_end": 65535}
+  ],
+  "default_action": "deny",
+  "session_timeout": 100,
+  "max_sessions": 2,
+  "events": [
+    {"timestamp": 0, "src_ip": "10.0.0.1", "dst_ip": "10.0.1.1",
+     "protocol": "tcp", "src_port": 1001, "dst_port": 80, "direction": "forward"},
+    {"timestamp": 1, "src_ip": "10.0.0.2", "dst_ip": "10.0.1.2",
+     "protocol": "tcp", "src_port": 1002, "dst_port": 80, "direction": "forward"},
+    {"timestamp": 2, "src_ip": "10.0.1.1", "dst_ip": "10.0.0.1",
+     "protocol": "tcp", "src_port": 80, "dst_port": 1001, "direction": "reverse"},
+    {"timestamp": 3, "src_ip": "10.0.0.3", "dst_ip": "10.0.1.3",
+     "protocol": "tcp", "src_port": 1003, "dst_port": 80, "direction": "forward"},
+    {"timestamp": 4, "src_ip": "10.0.1.2", "dst_ip": "10.0.0.2",
+     "protocol": "tcp", "src_port": 80, "dst_port": 1002, "direction": "reverse"}
+  ]
+}
+```
+
+响应（仅列逐事件关键字段）：
+
+```json
+{
+  "rule_count": 1,
+  "event_count": 5,
+  "default_action": "deny",
+  "session_timeout": 100,
+  "max_sessions": 2,
+  "results": [
+    {"index": 0, "match": {"type": "rule", "rule_index": 0}, "action": "allow",
+     "session_state": "new",
+     "session": {"key": {"protocol": "tcp", "src_ip": "10.0.0.1",
+                         "dst_ip": "10.0.1.1", "src_port": 1001, "dst_port": 80},
+                 "created_at": 0, "last_seen": 0, "expires_at": 100,
+                 "rule_index": 0, "established_by_event": 0},
+     "evicted_session": null},
+    {"index": 1, "match": {"type": "rule", "rule_index": 0}, "action": "allow",
+     "session_state": "new",
+     "session": {"key": {"protocol": "tcp", "src_ip": "10.0.0.2",
+                         "dst_ip": "10.0.1.2", "src_port": 1002, "dst_port": 80},
+                 "created_at": 1, "last_seen": 1, "expires_at": 101,
+                 "rule_index": 0, "established_by_event": 1},
+     "evicted_session": null},
+    {"index": 2, "match": {"type": "stateful", "rule_index": null},
+     "action": "allow", "session_state": "active",
+     "session": {"key": {"protocol": "tcp", "src_ip": "10.0.0.1",
+                         "dst_ip": "10.0.1.1", "src_port": 1001, "dst_port": 80},
+                 "created_at": 0, "last_seen": 2, "expires_at": 100,
+                 "rule_index": 0, "established_by_event": 0},
+     "evicted_session": null},
+    {"index": 3, "match": {"type": "rule", "rule_index": 0}, "action": "allow",
+     "session_state": "new",
+     "session": {"key": {"protocol": "tcp", "src_ip": "10.0.0.3",
+                         "dst_ip": "10.0.1.3", "src_port": 1003, "dst_port": 80},
+                 "created_at": 3, "last_seen": 3, "expires_at": 103,
+                 "rule_index": 0, "established_by_event": 3},
+     "evicted_session": {
+       "key": {"protocol": "tcp", "src_ip": "10.0.0.2", "dst_ip": "10.0.1.2",
+               "src_port": 1002, "dst_port": 80},
+       "created_at": 1, "last_seen": 1, "expires_at": 101,
+       "rule_index": 0, "established_by_event": 1
+     }},
+    {"index": 4, "match": {"type": "rule", "rule_index": 0}, "action": "allow",
+     "session_state": "none", "session": null, "evicted_session": null}
+  ],
+  "summary": {
+    "allowed": 5,
+    "denied": 0,
+    "new_sessions": 3,
+    "expired_sessions": 0,
+    "evicted_sessions": 1,
+    "active_sessions": 2
   }
 }
 ```
@@ -1692,6 +1816,7 @@ curl -s http://localhost:8000/firewall/simulate \
     ],
     "default_action": "deny",
     "session_timeout": 30,
+    "max_sessions": 10000,
     "events": [
       {"timestamp":0,"src_ip":"10.0.0.10","dst_ip":"10.0.1.20",
        "protocol":"tcp","src_port":40000,"dst_port":80,"direction":"forward"},
@@ -1729,13 +1854,14 @@ curl -s http://localhost:8000/firewall/simulate \
   路由条目的 `cidr` / `next_hop` / `metric` 未通过与 `/routes/resolve`
   相同的严格 IPv4 / 整数校验（允许为空数组 `[]`，此时整表不可达）
 - `/firewall/simulate` 缺少 `rules` / `events` / `default_action` /
-  `session_timeout`、规则数超过 500、事件数不在 1～2000、`session_timeout`
-  不在 1～86400 或不是整数、**时间戳乱序**（非负整数且必须严格递增，全部
-  违规位置在 `detail.violations` 中一次性列出）、**重叠会话键**（新会话正向/
-  反向键与存活会话冲突，`detail` 给出 `index` / `conflict` /
-  `existing_index` / `session_key`）；**非法端口**（越界、`true` / `1.5` /
-  `"80"` 等非整数、范围 `port_start > port_end`、tcp/udp 缺端口、icmp 带
-  端口）、非法 `protocol` / `direction` 同样 422
+  `session_timeout` / `max_sessions`、规则数超过 500、事件数不在 1～2000、
+  `session_timeout` 不在 1～86400、`max_sessions` 不在 1～10000 或不是整数、
+  **时间戳乱序**（非负整数且必须严格递增，全部违规位置在
+  `detail.violations` 中一次性列出）、**重叠会话键**（新会话正向/反向键与
+  存活会话冲突，`detail` 给出 `index` / `conflict` / `existing_index` /
+  `session_key`）；**非法端口**（越界、`true` / `1.5` / `"80"` 等非整数、
+  范围 `port_start > port_end`、tcp/udp 缺端口、icmp 带端口）、非法
+  `protocol` / `direction` 同样 422
 - 非法 CIDR：格式错误、前缀越界（`/33`）、主机位非零（`10.0.0.1/8`）等
 - IPv6 地址或网段：`2001:db8::/32`、`::1` 等
 - 非法 / 缺失 `action` 或 `default_action`、字段类型错误、JSON 格式错误
@@ -1778,10 +1904,14 @@ metric、同网段高 metric 遮蔽、同 metric 并行路由共享集合且保�
 不可达、承载/不可达/逐条生效之和等汇总不变量、422 与数量边界，
 `/firewall/simulate` 的首条规则匹配（源/目的 CIDR、协议、目的端口范围、
 顺序优先）、默认动作、首个正向 allow 建会话、存活期内正向后续包与反向包
-stateful 放行、过期边界（含边界时刻仍存活）与惰性清理、超时后重新走规则、
+stateful 放行（正/反向命中均刷新 `last_seen` 但不延长固定过期时刻）、
+过期边界（含边界时刻仍存活）与惰性清理、超时后重新走规则、
 反向包重放行不建会话、正向包过期重建（expired_reestablished）、拒绝不建会话、
 icmp 无端口五元组、固定存活时间不被流量刷新、乱序时间戳一次性报告、反向键
-重叠会话 422 且过期后建立合法、非法端口/协议/方向/存活时间 422 与数量边界，
+重叠会话 422 且过期后建立合法、重叠检查先于容量淘汰、容量满时按
+`last_seen`（最早、`established_by_event` 次序兜底）淘汰存活会话、逐事件
+`evicted_session` 与 `summary.evicted_sessions`、被淘汰流后续包重新按规则
+裁决、过期清出容量不淘汰、非法端口/协议/方向/存活时间/容量 422 与数量边界，
 以及用标准库 `ipaddress.collapse_addresses` 作为 oracle
 的随机属性测试（无损 + 最少块，并与逐地址暴力判定/逐路由暴力 LPM 对比；
 failover 与“过滤失败下一跳后重新 resolve”的 oracle 交叉验证；
@@ -1797,7 +1927,7 @@ audit 与逐地址暴力“最长前缀 + 最低 metric + ECMP”oracle 交叉�
 │   ├── __init__.py
 │   ├── analyzer.py    # 核心：CIDR 解析、区间差集、最少 CIDR 压缩、规则分析、等价比较、裁决归因、包含层级与网段清单差异
 │   ├── router.py      # 核心：严格 IPv4 地址校验、最长前缀匹配 + 最低 metric 的 ECMP 路由解析、下一跳故障切换与整表空间审计
-│   ├── firewall.py    # 核心：有序五元组规则首条匹配、正向建会话、反向 stateful 放行、超时惰性清理与重判、乱序/重叠校验
+│   ├── firewall.py    # 核心：有序五元组规则首条匹配、正向建会话、反向 stateful 放行（last_seen 刷新）、超时惰性清理与重判、固定容量 LRU 淘汰、乱序/重叠校验
 │   └── main.py        # FastAPI 应用、请求/响应模型与 /analyze、/compare、/explain、/cidrs/hierarchy、/cidrs/diff、/routes/resolve、/routes/failover、/routes/audit、/firewall/simulate 接口
 ├── tests/
 │   ├── test_analyzer.py
@@ -1870,10 +2000,17 @@ audit 与逐地址暴力“最长前缀 + 最低 metric + ECMP”oracle 交叉�
   反向包经地址/端口对调后用同一个键查表，因此无需独立反向索引；每个事件
   处理前以 `expires_at < 当前时间戳` **惰性清理**过期会话（边界时刻仍存活，
   固定时长不随流量刷新），清理按会话记账到 `expired_sessions`，并保留最近
-  过期会话以区分 `expired` 与 `none`。存活会话命中即 `stateful` 放行；否则
-  按顺序线性扫描规则做整数包含 + 端口比较，未命中取默认动作；仅正向 allow
-  建立会话，建立前同时检查正向键（重复建立）与反向键（两个反向会话同时存活
-  的歧义）是否撞上存活会话。时间戳严格递增的违规在解析阶段一次性收集后
-  抛出，不产生部分结果。
+  过期会话以区分 `expired` 与 `none`。存活会话命中（正向或反向）即
+  `stateful` 放行，并把会话 `last_seen` 刷新为当前事件时间（新会话
+  `last_seen` 等于建立时间；不改变 `expires_at`）；否则按顺序线性扫描规则
+  做整数包含 + 端口比较，未命中取默认动作；仅正向 allow 建立会话，建立前
+  先检查正向键（重复建立）与反向键（两个反向会话同时存活的歧义）是否撞上
+  存活会话，重叠即报错、不产生部分结果。会话表容量固定为 `max_sessions`：
+  通过重叠检查、确认可建会话后若容量已满，按
+  `(last_seen, established_by_event)` 升序选出唯一存活会话淘汰——事件时间
+  严格递增使 `last_seen` 跨会话不可能相等，后者为防御性兜底次序；被淘汰
+  会话逐事件记入 `evicted_session` 并按会话累计到 `summary.evicted_sessions`，
+  随即从会话表移除，该流后续包像从未建过会话一样重新走规则。时间戳严格
+  递增的违规在解析阶段一次性收集后抛出，不产生部分结果。
 - **整数运算**：全部基于 32 位无符号整数区间处理，避免字符串/对象开销，
   可正确支持 `0.0.0.0/0` 全空间等边界场景。

@@ -22,6 +22,7 @@ from .analyzer import (
 from .firewall import (
     FIREWALL_EVENTS_MAX,
     FIREWALL_RULES_MAX,
+    MAX_SESSIONS_MAX,
     SESSION_TIMEOUT_MAX,
     OutOfOrderTimestampsError,
     OverlappingSessionError,
@@ -60,9 +61,10 @@ app = FastAPI(
         "与无损最少 CIDR）。"
         "通过 /firewall/simulate 模拟有状态防火墙：有序五元组规则按首条匹配"
         "裁决，首个正向 allow 建立五元组会话，存活期内反向包 stateful 放行，"
-        "超时后重新走规则匹配。"
+        "超时后重新走规则匹配；会话表容量固定，建会话遇容量满时按 "
+        "last_seen 淘汰最早的存活会话。"
     ),
-    version="1.8.0",
+    version="1.9.0",
 )
 
 
@@ -775,6 +777,14 @@ class FirewallSimulateRequest(BaseModel):
         ..., ge=1, le=SESSION_TIMEOUT_MAX, strict=True,
         description="会话固定存活时间（秒），1～86400；边界时刻仍存活，严格超时才清理",
     )
+    max_sessions: int = Field(
+        ..., ge=1, le=MAX_SESSIONS_MAX, strict=True,
+        description=(
+            "固定会话表容量（最大并发存活会话数），1～10000；正向 allow 建会话"
+            "通过重叠检查后若容量已满，先淘汰 last_seen 最早（相同则 "
+            "established_by_event 最小）的存活会话"
+        ),
+    )
 
     @field_validator("default_action", mode="before")
     @classmethod
@@ -812,6 +822,13 @@ class FirewallSessionKey(BaseModel):
 class FirewallSession(BaseModel):
     key: FirewallSessionKey = Field(..., description="正向五元组会话键")
     created_at: int = Field(..., description="会话建立时间（首个正向 allow 的时间戳）")
+    last_seen: int = Field(
+        ...,
+        description=(
+            "最近一次命中该会话的事件时间（stateful 放行的正向/反向包均刷新为"
+            "当前事件时间）；新会话等于 created_at，固定过期时刻不因此延长"
+        ),
+    )
     expires_at: int = Field(..., description="会话过期边界时间（created_at + session_timeout）")
     rule_index: int | None = Field(..., description="建立会话的 allow 规则序号（从 0 开始）")
     established_by_event: int = Field(..., description="建立该会话的事件序号（从 0 开始）")
@@ -845,6 +862,13 @@ class FirewallEventResult(BaseModel):
             "expired 为已过期会话；none 为 null"
         ),
     )
+    evicted_session: FirewallSession | None = Field(
+        ...,
+        description=(
+            "本事件为建会话而淘汰的存活会话（容量满时按 last_seen 最早、"
+            "established_by_event 最小选出）；未发生淘汰时为 null"
+        ),
+    )
 
 
 class FirewallSummary(BaseModel):
@@ -852,6 +876,9 @@ class FirewallSummary(BaseModel):
     denied: int = Field(..., description="最终动作为 deny 的事件数")
     new_sessions: int = Field(..., description="新建会话数（含过期重建）")
     expired_sessions: int = Field(..., description="惰性清理掉的过期会话总数（按会话计）")
+    evicted_sessions: int = Field(
+        ..., description="因会话表容量满而被淘汰的存活会话总数（按会话计）"
+    )
     active_sessions: int = Field(..., description="全部事件处理完后仍存活的会话数")
 
 
@@ -860,6 +887,7 @@ class FirewallSimulateResponse(BaseModel):
     event_count: int = Field(..., description="请求中的事件数")
     default_action: Literal["allow", "deny"]
     session_timeout: int = Field(..., description="会话固定存活时间（秒）")
+    max_sessions: int = Field(..., description="固定会话表容量（最大并发存活会话数）")
     results: list[FirewallEventResult] = Field(
         ..., description="逐事件裁决结果，严格保持 events 输入顺序"
     )
@@ -1542,6 +1570,7 @@ def firewall_simulate(
                     ],
                     "default_action": "deny",
                     "session_timeout": 30,
+                    "max_sessions": 10000,
                     "events": [
                         {
                             "timestamp": 0,
@@ -1581,7 +1610,72 @@ def firewall_simulate(
                         },
                     ],
                 },
-            }
+            },
+            "eviction": {
+                "summary": "容量为 2：建第三个会话时淘汰 last_seen 最早的存活会话",
+                "value": {
+                    "rules": [
+                        {
+                            "action": "allow",
+                            "src_cidr": "0.0.0.0/0",
+                            "dst_cidr": "0.0.0.0/0",
+                            "protocol": "tcp",
+                            "port_start": 0,
+                            "port_end": 65535,
+                        }
+                    ],
+                    "default_action": "deny",
+                    "session_timeout": 100,
+                    "max_sessions": 2,
+                    "events": [
+                        {
+                            "timestamp": 0,
+                            "src_ip": "10.0.0.1",
+                            "dst_ip": "10.0.1.1",
+                            "protocol": "tcp",
+                            "src_port": 1001,
+                            "dst_port": 80,
+                            "direction": "forward",
+                        },
+                        {
+                            "timestamp": 1,
+                            "src_ip": "10.0.0.2",
+                            "dst_ip": "10.0.1.2",
+                            "protocol": "tcp",
+                            "src_port": 1002,
+                            "dst_port": 80,
+                            "direction": "forward",
+                        },
+                        {
+                            "timestamp": 2,
+                            "src_ip": "10.0.1.1",
+                            "dst_ip": "10.0.0.1",
+                            "protocol": "tcp",
+                            "src_port": 80,
+                            "dst_port": 1001,
+                            "direction": "reverse",
+                        },
+                        {
+                            "timestamp": 3,
+                            "src_ip": "10.0.0.3",
+                            "dst_ip": "10.0.1.3",
+                            "protocol": "tcp",
+                            "src_port": 1003,
+                            "dst_port": 80,
+                            "direction": "forward",
+                        },
+                        {
+                            "timestamp": 4,
+                            "src_ip": "10.0.1.2",
+                            "dst_ip": "10.0.0.2",
+                            "protocol": "tcp",
+                            "src_port": 80,
+                            "dst_port": 1002,
+                            "direction": "reverse",
+                        },
+                    ],
+                },
+            },
         },
     ),
 ) -> dict:
@@ -1596,24 +1690,31 @@ def firewall_simulate(
       ``session_timeout`` 秒（不因后续包刷新；``created_at + session_timeout``
       边界时刻仍存活，严格超过才过期）。
     - **状态放行**：存活期内该会话的后续正向包与 **reverse** 包（地址/端口
-      对调后命中同一会话）一律 ``stateful`` 放行，不再查规则。
+      对调后命中同一会话）一律 ``stateful`` 放行，不再查规则；每次命中都把
+      会话 ``last_seen`` 刷新为当前事件时间（新会话的 ``last_seen`` 等于
+      建立时间）。
     - **超时重判**：每个事件处理前按其时间戳**惰性清理**过期会话；过期后
       的包（含反向包）必须重新走规则匹配——反向包即使重新被 allow 也不建会话，
       正向包重新 allow 则**重建**会话（``expired_reestablished``）。
+    - **固定容量淘汰**：会话表容量固定为 ``max_sessions``（1～10000）。正向
+      allow **先做现有重叠检查**，确认可建会话且容量已满时，淘汰
+      ``last_seen`` 最早的存活会话（相同则 ``established_by_event`` 最小者
+      优先）后再建新会话；逐事件返回 ``evicted_session``（未淘汰为 null），
+      被淘汰流的后续包必须**重新按规则裁决**。
     - **重叠会话键**：新会话的正向键或反向键与任何存活会话冲突（同键重复
       建立、或两个方向相反的会话同时存活）时返回 **422**
       （``error="overlapping_session"``），不产生部分结果。
 
     每个事件返回命中来源（``rule`` / ``stateful`` / ``default`` +
     规则序号）、最终动作、会话状态（``new`` / ``active`` / ``expired`` /
-    ``expired_reestablished`` / ``none``）与会话信息；``summary`` 汇总
-    放行 / 拒绝事件数、新建会话数、惰性清理的过期会话数与处理结束后仍存活
-    的会话数。
+    ``expired_reestablished`` / ``none``）、会话信息（含 ``last_seen``）与
+    淘汰会话；``summary`` 汇总放行 / 拒绝事件数、新建会话数、惰性清理的
+    过期会话数、容量淘汰会话数与处理结束后仍存活的会话数。
 
     事件时间戳必须为非负整数且**严格递增**，违规时返回 **422**
     （``error="out_of_order_timestamps"``）并一次性列出全部违规位置；
     非法 CIDR / IPv4 地址、端口（越界、bool/float、范围倒置、icmp 带端口）、
-    协议、方向与存活时间同样返回 **422**。
+    协议、方向、存活时间与容量参数同样返回 **422**。
     """
     try:
         return simulate_firewall(
@@ -1642,6 +1743,7 @@ def firewall_simulate(
             ],
             request.default_action,
             request.session_timeout,
+            request.max_sessions,
         )
     except OutOfOrderTimestampsError as exc:
         # 时间戳乱序：422 并一次性列出全部违规位置

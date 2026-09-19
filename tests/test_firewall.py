@@ -4,6 +4,7 @@ import pytest
 from app.firewall import (
     FIREWALL_EVENTS_MAX,
     FIREWALL_RULES_MAX,
+    MAX_SESSIONS_MAX,
     PORT_MAX,
     SESSION_TIMEOUT_MAX,
     CONFLICT_REVERSE,
@@ -14,6 +15,7 @@ from app.firewall import (
     OutOfOrderTimestampsError,
     OverlappingSessionError,
     normalize_direction,
+    normalize_max_sessions,
     normalize_port,
     normalize_protocol,
     normalize_session_timeout,
@@ -42,8 +44,8 @@ def rev(timestamp, src="2.2.2.2", sport=80, dst="1.1.1.1", dport=1000, proto="tc
     return (timestamp, src, dst, proto, sport, dport, "reverse")
 
 
-def simulate(events, rules=(ALLOW_ALL_TCP,), default="deny", timeout=30):
-    return simulate_firewall(list(rules), events, default, timeout)
+def simulate(events, rules=(ALLOW_ALL_TCP,), default="deny", timeout=30, max_sessions=10000):
+    return simulate_firewall(list(rules), events, default, timeout, max_sessions)
 
 
 # ---------- 校验函数 ----------
@@ -94,6 +96,17 @@ def test_normalize_session_timeout_rejects_bad(value):
         normalize_session_timeout(value)
 
 
+@pytest.mark.parametrize("value", [1, 2, 10000, MAX_SESSIONS_MAX])
+def test_normalize_max_sessions_accepts_range(value):
+    assert normalize_max_sessions(value) == value
+
+
+@pytest.mark.parametrize("value", [0, MAX_SESSIONS_MAX + 1, -1, True, 1.0, "100", None])
+def test_normalize_max_sessions_rejects_bad(value):
+    with pytest.raises(ValueError):
+        normalize_max_sessions(value)
+
+
 # ---------- 基础语义 ----------
 
 
@@ -112,15 +125,18 @@ def test_first_forward_allow_creates_session():
             "dst_port": 80,
         },
         "created_at": 0,
+        "last_seen": 0,
         "expires_at": 30,
         "rule_index": 0,
         "established_by_event": 0,
     }
+    assert event["evicted_session"] is None
     assert result["summary"] == {
         "allowed": 1,
         "denied": 0,
         "new_sessions": 1,
         "expired_sessions": 0,
+        "evicted_sessions": 0,
         "active_sessions": 1,
     }
 
@@ -135,6 +151,10 @@ def test_reverse_packets_statefully_allowed_within_timeout():
     # stateful 放行携带原会话信息（含建立规则索引）
     assert result["results"][1]["session"]["rule_index"] == 0
     assert result["results"][1]["session"]["established_by_event"] == 0
+    # 每次 stateful 命中（正向/反向）都把 last_seen 刷新为当前事件时间
+    assert [e["session"]["last_seen"] for e in result["results"]] == [0, 5, 29]
+    # 固定过期时刻不因 last_seen 刷新而延长
+    assert all(e["session"]["expires_at"] == 30 for e in result["results"])
 
 
 def test_expiry_boundary_inclusive():
@@ -152,6 +172,7 @@ def test_expiry_boundary_inclusive():
         "denied": 0,
         "new_sessions": 1,
         "expired_sessions": 1,
+        "evicted_sessions": 0,
         "active_sessions": 0,
     }
 
@@ -172,12 +193,14 @@ def test_forward_re_allow_after_expiry_reestablishes_session():
     assert states == ["new", "expired_reestablished"]
     second = result["results"][1]
     assert second["session"]["created_at"] == 40
+    assert second["session"]["last_seen"] == 40
     assert second["session"]["expires_at"] == 70
     assert result["summary"] == {
         "allowed": 2,
         "denied": 0,
         "new_sessions": 2,
         "expired_sessions": 1,
+        "evicted_sessions": 0,
         "active_sessions": 1,
     }
 
@@ -395,15 +418,23 @@ def test_bad_cidr_and_address_propagate():
 
 def test_size_limits():
     with pytest.raises(ValueError):
-        simulate_firewall([ALLOW_ALL_TCP] * (FIREWALL_RULES_MAX + 1), [fwd(0)], "deny", 30)
+        simulate_firewall(
+            [ALLOW_ALL_TCP] * (FIREWALL_RULES_MAX + 1), [fwd(0)], "deny", 30, 10000
+        )
     with pytest.raises(ValueError):
-        simulate_firewall([], [], "deny", 30)
+        simulate_firewall([], [], "deny", 30, 10000)
     with pytest.raises(ValueError):
         simulate_firewall(
             [], [fwd(i, sport=(1000 + i) % 65000) for i in range(FIREWALL_EVENTS_MAX + 1)],
             "deny",
             30,
+            10000,
         )
+    # max_sessions 边界：0 与 10001 均非法
+    with pytest.raises(ValueError):
+        simulate_firewall([ALLOW_ALL_TCP], [fwd(0)], "deny", 30, 0)
+    with pytest.raises(ValueError):
+        simulate_firewall([ALLOW_ALL_TCP], [fwd(0)], "deny", 30, MAX_SESSIONS_MAX + 1)
 
 
 def test_limits_accepted():
@@ -422,8 +453,180 @@ def test_result_order_matches_event_order():
 
 
 def test_top_level_echo_fields():
-    result = simulate([fwd(0)], default="deny", timeout=45)
+    result = simulate([fwd(0)], default="deny", timeout=45, max_sessions=128)
     assert result["rule_count"] == 1
     assert result["event_count"] == 1
     assert result["default_action"] == "deny"
     assert result["session_timeout"] == 45
+    assert result["max_sessions"] == 128
+
+
+# ---------- 固定容量与淘汰 ----------
+
+
+def test_capacity_full_evicts_oldest_last_seen():
+    # 容量 2：流 A(t0，t2 反向刷新)、流 B(t1)，t3 建流 C 时淘汰 last_seen
+    # 最早的 B（last_seen=1）而非 A（last_seen=2）
+    events = [
+        fwd(0, sport=1001),
+        fwd(1, sport=1002),
+        rev(2, sport=80, dport=1001),
+        fwd(3, sport=1003),
+    ]
+    result = simulate(events, timeout=100, max_sessions=2)
+    evicted = [e["evicted_session"] for e in result["results"]]
+    assert evicted[:3] == [None, None, None]
+    assert evicted[3] is not None
+    assert evicted[3]["key"]["src_port"] == 1002
+    assert evicted[3]["created_at"] == 1
+    assert evicted[3]["last_seen"] == 1
+    assert evicted[3]["established_by_event"] == 1
+
+    assert [e["session_state"] for e in result["results"]] == [
+        "new", "new", "active", "new",
+    ]
+    assert result["summary"] == {
+        "allowed": 4,
+        "denied": 0,
+        "new_sessions": 3,
+        "expired_sessions": 0,
+        "evicted_sessions": 1,
+        "active_sessions": 2,
+    }
+
+
+def test_evicted_flows_subsequent_packets_re_adjudicated_as_none():
+    # A(t0) 在 t2 被反向包刷新（last_seen=2）；建 C(t3) 时淘汰 last_seen=1 的 B。
+    # t4 B 的反向包无存活会话，按规则重新裁决：
+    # allow-all 放行但反向不建会话，session_state 为 none（既未过期也无会话）
+    events = [
+        fwd(0, sport=1001),
+        fwd(1, sport=1002),
+        rev(2, src="2.2.2.2", sport=80, dst="1.1.1.1", dport=1001),  # A 刷新
+        fwd(3, sport=1003),                        # 淘汰 B
+        rev(4, src="2.2.2.2", sport=80, dst="1.1.1.1", dport=1002),  # B 的反向包
+        fwd(5, sport=1002),                        # B 的正向包：重新建会话
+    ]
+    result = simulate(events, timeout=100, max_sessions=2)
+    assert result["results"][3]["evicted_session"]["key"]["src_port"] == 1002
+    fourth = result["results"][4]
+    assert fourth["match"]["type"] == "rule"
+    assert fourth["action"] == "allow"
+    assert fourth["session_state"] == "none"
+    assert fourth["session"] is None
+
+    fifth = result["results"][5]
+    assert fifth["session_state"] == "new"
+    assert fifth["session"]["created_at"] == 5
+
+
+def test_oldest_established_session_evicted_without_refresh():
+    # 容量 2：A(t0)、B(t1) 均无后续流量（last_seen 分别为 0、1），
+    # t2 建 C 时淘汰 last_seen 最早的 A（established_by_event 也最小）。
+    # 注：时间戳严格递增，last_seen 跨存活会话不可能相等；
+    # established_by_event 仅作相同 last_seen 时的防御性兜底次序。
+    events = [
+        fwd(0, sport=1001),
+        fwd(1, sport=1002),
+        fwd(2, sport=1003),
+    ]
+    result = simulate(events, timeout=100, max_sessions=2)
+    assert result["results"][2]["evicted_session"]["key"]["src_port"] == 1001
+    assert result["results"][2]["evicted_session"]["established_by_event"] == 0
+
+
+def test_capacity_one_each_new_session_evicts_previous():
+    events = [fwd(i, sport=1000 + i) for i in range(5)]
+    result = simulate(events, timeout=1000, max_sessions=1)
+    assert [e["evicted_session"] is None for e in result["results"]] == [
+        True, False, False, False, False,
+    ]
+    for i, event in enumerate(result["results"][1:], start=1):
+        assert event["evicted_session"]["established_by_event"] == i - 1
+    assert result["summary"]["evicted_sessions"] == 4
+    assert result["summary"]["active_sessions"] == 1
+
+
+def test_expiry_frees_capacity_without_eviction():
+    # timeout=10：A(t0,expires=10)、B(t1,expires=11) 在 t=12 的事件前均已
+    # 严格过期并被惰性清理；建 C 不触发淘汰
+    events = [
+        fwd(0, sport=1001),
+        fwd(1, sport=1002),
+        fwd(12, sport=1003),
+    ]
+    result = simulate(events, timeout=10, max_sessions=2)
+    assert result["results"][2]["evicted_session"] is None
+    assert result["results"][2]["session_state"] == "new"
+    assert result["summary"] == {
+        "allowed": 3,
+        "denied": 0,
+        "new_sessions": 3,
+        "expired_sessions": 2,
+        "evicted_sessions": 0,
+        "active_sessions": 1,
+    }
+
+
+def test_denied_packet_does_not_evict_when_full():
+    # 仅 10.0.0.0/24 放行：先建满 2 个会话，第三个被拒的正向包不触发淘汰
+    allow_lan = ("allow", "10.0.0.0/24", "0.0.0.0/0", "tcp", 0, 65535)
+    events = [
+        fwd(0, src="10.0.0.1", sport=1001),
+        fwd(1, src="10.0.0.2", sport=1002),
+        fwd(2, src="9.9.9.9", sport=1003),        # 未命中规则，默认 deny
+    ]
+    result = simulate(
+        events,
+        rules=(allow_lan,),
+        default="deny",
+        timeout=100,
+        max_sessions=2,
+    )
+    assert [e["match"]["type"] for e in result["results"]] == [
+        "rule", "rule", "default",
+    ]
+    assert result["results"][2]["action"] == "deny"
+    assert result["results"][2]["evicted_session"] is None
+    assert result["summary"]["evicted_sessions"] == 0
+    assert result["summary"]["active_sessions"] == 2
+
+
+def test_overlap_check_runs_before_eviction_no_partial_result():
+    # 容量已满（A 存活），事件 1 的新会话反向键与 A 冲突：重叠错误优先，
+    # 不淘汰任何会话
+    events = [
+        fwd(0, src="1.1.1.1", sport=1000, dst="2.2.2.2", dport=80),
+        fwd(1, src="2.2.2.2", sport=80, dst="1.1.1.1", dport=1000),
+    ]
+    with pytest.raises(OverlappingSessionError):
+        simulate(events, timeout=100, max_sessions=1)
+
+
+def test_reestablish_after_expiry_at_full_capacity_does_not_evict():
+    # 容量 1：A 在 t=40 已过期并被清理，同流重建不需要淘汰
+    result = simulate([fwd(0), fwd(40)], timeout=30, max_sessions=1)
+    assert result["results"][1]["session_state"] == "expired_reestablished"
+    assert result["results"][1]["evicted_session"] is None
+    assert result["summary"] == {
+        "allowed": 2,
+        "denied": 0,
+        "new_sessions": 2,
+        "expired_sessions": 1,
+        "evicted_sessions": 0,
+        "active_sessions": 1,
+    }
+
+
+def test_evicted_session_snapshot_carries_last_seen():
+    events = [
+        fwd(0, sport=1001),
+        fwd(1, sport=1002),
+        rev(5, sport=80, dport=1001),
+        fwd(6, sport=1003),
+    ]
+    result = simulate(events, timeout=100, max_sessions=2)
+    # A 的 last_seen 已刷新到 5；被淘汰的是 last_seen=1 的 B
+    evicted = result["results"][3]["evicted_session"]
+    assert evicted["last_seen"] == 1
+    assert result["results"][2]["session"]["last_seen"] == 5

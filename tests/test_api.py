@@ -1531,7 +1531,8 @@ def test_audit_existing_endpoints_unchanged():
 # ---------- /firewall/simulate ----------
 
 
-def post_firewall(rules, events, default_action="deny", session_timeout=30):
+def post_firewall(rules, events, default_action="deny", session_timeout=30,
+                  max_sessions=10000):
     return client.post(
         "/firewall/simulate",
         json={
@@ -1539,6 +1540,7 @@ def post_firewall(rules, events, default_action="deny", session_timeout=30):
             "events": events,
             "default_action": default_action,
             "session_timeout": session_timeout,
+            "max_sessions": max_sessions,
         },
     )
 
@@ -1589,6 +1591,7 @@ def test_firewall_stateful_lifecycle_and_summary():
     assert body["event_count"] == 5
     assert body["default_action"] == "deny"
     assert body["session_timeout"] == 30
+    assert body["max_sessions"] == 10000
 
     results = body["results"]
     assert [r["index"] for r in results] == [0, 1, 2, 3, 4]
@@ -1619,19 +1622,26 @@ def test_firewall_stateful_lifecycle_and_summary():
         "dst_port": 80,
     }
     assert session["created_at"] == 0
+    assert session["last_seen"] == 5  # 反向 stateful 命中刷新 last_seen
     assert session["expires_at"] == 30
     assert session["rule_index"] == 0
     assert session["established_by_event"] == 0
+    assert results[2]["session"]["last_seen"] == 30
 
     assert results[3]["session"]["expires_at"] == 30  # expired 带原会话
     assert results[4]["session"]["created_at"] == 50
+    assert results[4]["session"]["last_seen"] == 50
     assert results[4]["session"]["expires_at"] == 80
+
+    # 容量充足时所有事件均无淘汰
+    assert all(r["evicted_session"] is None for r in results)
 
     assert body["summary"] == {
         "allowed": 4,
         "denied": 1,
         "new_sessions": 2,
         "expired_sessions": 1,
+        "evicted_sessions": 0,
         "active_sessions": 1,
     }
 
@@ -1648,11 +1658,13 @@ def test_firewall_denied_forward_no_session_and_reverse_denied():
     assert [r["match"]["type"] for r in results] == ["rule", "rule"]
     assert [r["session_state"] for r in results] == ["none", "none"]
     assert all(r["session"] is None for r in results)
+    assert all(r["evicted_session"] is None for r in results)
     assert resp.json()["summary"] == {
         "allowed": 0,
         "denied": 2,
         "new_sessions": 0,
         "expired_sessions": 0,
+        "evicted_sessions": 0,
         "active_sessions": 0,
     }
 
@@ -1768,11 +1780,16 @@ def test_firewall_validation_422():
     assert client.post(
         "/firewall/simulate",
         json={"rules": [], "events": [valid_event], "default_action": "deny"},
-    ).status_code == 422  # 缺 session_timeout
+    ).status_code == 422  # 缺 session_timeout / max_sessions
     assert client.post(
         "/firewall/simulate",
         json={"rules": [], "events": [valid_event], "session_timeout": 30},
-    ).status_code == 422  # 缺 default_action
+    ).status_code == 422  # 缺 default_action / max_sessions
+    assert client.post(
+        "/firewall/simulate",
+        json={"rules": [], "events": [valid_event], "default_action": "deny",
+              "session_timeout": 30},
+    ).status_code == 422  # 缺 max_sessions
 
     # 空事件 / 超过 2000 个事件
     assert post_firewall([valid_rule], []).status_code == 422
@@ -1819,9 +1836,20 @@ def test_firewall_validation_422():
         resp = client.post(
             "/firewall/simulate",
             json={"rules": [], "events": [valid_event],
-                  "default_action": "deny", "session_timeout": bad_timeout},
+                  "default_action": "deny", "session_timeout": bad_timeout,
+                  "max_sessions": 10000},
         )
         assert resp.status_code == 422, bad_timeout
+
+    # 非法 max_sessions：0 / 10001 / 负数 / bool / float / 字符串
+    for bad_capacity in [0, 10001, -1, True, 1.5, "100"]:
+        resp = client.post(
+            "/firewall/simulate",
+            json={"rules": [], "events": [valid_event],
+                  "default_action": "deny", "session_timeout": 30,
+                  "max_sessions": bad_capacity},
+        )
+        assert resp.status_code == 422, bad_capacity
 
     # 非法协议 / 方向 / 动作 / CIDR / 地址
     assert post_firewall(
@@ -1865,12 +1893,84 @@ def test_firewall_openapi_documented():
         "FirewallSessionKey",
     ):
         assert name in spec["components"]["schemas"], name
+    # max_sessions 必填且带 1～10000 边界
+    request_props = spec["components"]["schemas"]["FirewallSimulateRequest"]["properties"]
+    assert request_props["max_sessions"]["minimum"] == 1
+    assert request_props["max_sessions"]["maximum"] == 10000
+    required = spec["components"]["schemas"]["FirewallSimulateRequest"]["required"]
+    assert "max_sessions" in required
+    # 会话对象含 last_seen；逐事件结果含 evicted_session；summary 含 evicted_sessions
+    session_props = spec["components"]["schemas"]["FirewallSession"]["properties"]
+    assert "last_seen" in session_props
+    result_props = spec["components"]["schemas"]["FirewallEventResult"]["properties"]
+    assert "evicted_session" in result_props
+    summary_props = spec["components"]["schemas"]["FirewallSummary"]["properties"]
+    assert "evicted_sessions" in summary_props
     # 内置 422 错误示例
     examples = operation["responses"]["422"]["content"]["application/json"]["examples"]
     assert set(examples) == {"out_of_order", "overlapping"}
     # 请求示例
     req_examples = operation["requestBody"]["content"]["application/json"]["examples"]
-    assert "simulate" in req_examples
+    assert set(req_examples) == {"simulate", "eviction"}
+    assert req_examples["eviction"]["value"]["max_sessions"] == 2
+
+
+def test_firewall_capacity_eviction_and_rematch():
+    rules = [
+        {"action": "allow", "src_cidr": "0.0.0.0/0", "dst_cidr": "0.0.0.0/0",
+         "protocol": "tcp", "port_start": 0, "port_end": 65535},
+    ]
+    events = [
+        fw_event(0, "10.0.0.1", 1001, "10.0.1.1", 80),
+        fw_event(1, "10.0.0.2", 1002, "10.0.1.2", 80),
+        fw_event(2, "10.0.1.1", 80, "10.0.0.1", 1001, direction="reverse"),
+        fw_event(3, "10.0.0.3", 1003, "10.0.1.3", 80),
+        fw_event(4, "10.0.1.2", 80, "10.0.0.2", 1002, direction="reverse"),
+    ]
+    resp = post_firewall(rules, events, session_timeout=100, max_sessions=2)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["max_sessions"] == 2
+    results = body["results"]
+
+    # t=2 流 A 反向命中，last_seen 刷新为 2
+    assert results[2]["session_state"] == "active"
+    assert results[2]["session"]["last_seen"] == 2
+
+    # t=3 建流 C：容量已满，淘汰 last_seen 更早的流 B（1），而非 A（2）
+    assert results[3]["session_state"] == "new"
+    evicted = results[3]["evicted_session"]
+    assert evicted["key"] == {
+        "protocol": "tcp",
+        "src_ip": "10.0.0.2",
+        "dst_ip": "10.0.1.2",
+        "src_port": 1002,
+        "dst_port": 80,
+    }
+    assert evicted["created_at"] == 1
+    assert evicted["last_seen"] == 1
+    assert evicted["expires_at"] == 101
+    assert evicted["established_by_event"] == 1
+    assert results[3]["session"]["last_seen"] == 3
+
+    # t=4 被淘汰流 B 的反向包不再 stateful：重新按规则裁决（allow 但不建会话）
+    assert results[4]["match"]["type"] == "rule"
+    assert results[4]["action"] == "allow"
+    assert results[4]["session_state"] == "none"
+    assert results[4]["session"] is None
+    assert results[4]["evicted_session"] is None
+
+    assert [r["evicted_session"] is not None for r in results] == [
+        False, False, False, True, False,
+    ]
+    assert body["summary"] == {
+        "allowed": 5,
+        "denied": 0,
+        "new_sessions": 3,
+        "expired_sessions": 0,
+        "evicted_sessions": 1,
+        "active_sessions": 2,
+    }
 
 
 def test_firewall_existing_endpoints_unchanged():
